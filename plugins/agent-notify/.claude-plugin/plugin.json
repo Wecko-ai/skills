@@ -1,0 +1,13 @@
+{
+  "name": "wecko-agent-notify",
+  "version": "1.0.0",
+  "description": "Phone ping (ntfy, Telegram, any command) when Claude Code is really done: waits for background agents, teammates and shells, and stays quiet while you are at the Mac.",
+  "author": {
+    "name": "Wecko",
+    "url": "https://wecko.ai"
+  },
+  "homepage": "https://github.com/Wecko-ai/skills/tree/main/plugins/agent-notify",
+  "repository": "https://github.com/Wecko-ai/skills",
+  "license": "MIT",
+  "keywords": ["notifications", "hooks", "telegram", "ntfy", "macos"]
+}

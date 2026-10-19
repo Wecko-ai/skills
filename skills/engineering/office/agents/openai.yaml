@@ -1,0 +1,3 @@
+interface:
+  display_name: "Office"
+  short_description: "Boss a roster of headless agents on other models"

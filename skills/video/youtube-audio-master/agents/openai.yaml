@@ -1,0 +1,4 @@
+interface:
+  display_name: YouTube Audio Master
+  short_description: Fix a video's audio for YouTube
+  default_prompt: Check the audio of my final video and fix it for YouTube

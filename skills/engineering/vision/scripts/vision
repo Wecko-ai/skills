@@ -1,0 +1,229 @@
+#!/bin/zsh
+# vision: bridge DeepSeek v4 Flash (no vision) → GPT 5.6 Luna (vision expert)
+#
+# DeepSeek formulates a precise, detailed question about an image,
+# GPT 5.6 Luna answers with exhaustive structured analysis.
+#
+# Usage:
+#   vision <image> [<image>...] -- "detailed question"   multi-image
+#   vision <image-path> "detailed question about the image"   (legacy)
+#   echo "..." | vision dashboard.png -
+#
+# Appel : HTTP direct a un proxy OpenAI-compatible (VISION_BASE_URL, defaut
+# http://127.0.0.1:10100) en base64 data URL, model VISION_MODEL (defaut
+# opencode-go/gpt-5.6-luna). PAS opencode CLI : il est single-flight (2
+# invocations paralleles = HANG, verifie 2026-08-09) alors que le proxy gere
+# la concurrence. Bonus : usage API reel (VISION_USAGE_FILE) pour la telemetry.
+#
+# Robustesse :
+#   - Les images non-PNG/JPEG (HEIC/HEIF des scans iPhone, etc.) sont converties
+#     en PNG avant l'appel (sips) : un HEIC brut a fait halluciner l'analyse
+#     sans l'image (2026-08-08).
+#   - Timeout : chaque appel est tue apres VISION_TIMEOUT s (par defaut 120) :
+#     un modele bloque ne laisse plus trainer de process orphelin.
+#   - Concurrence : pool de VISION_MAX_PARALLEL slots (defaut 1), chaque appel
+#     attend un slot libre via shlock + reclamation des locks stales (PID
+#     mort) : plus de fan-out sauvage. Exit 75 = pool sature.
+#   - Zero tools : appel HTTP direct = Luna est un juge visuel pur, aucun acces
+#     fichiersysteme (opencode donnait des outils Read/Glob, un fichier a
+#     ete lu par erreur le 2026-08-09).
+#   - Echec explicite : transport != 0 = exit non-zero, jamais de reponse inventee.
+#
+# Variables d'environnement (toutes optionnelles) : VISION_MODEL, VISION_BASE_URL,
+# VISION_AUTH, VISION_TIMEOUT, VISION_MAX_PARALLEL, VISION_LOCK_WAIT, VISION_USAGE_FILE.
+
+set -euo pipefail
+
+VISION_MODEL="${VISION_MODEL:-opencode-go/gpt-5.6-luna}"
+VISION_TIMEOUT="${VISION_TIMEOUT:-120}"
+VISION_MAX_PARALLEL="${VISION_MAX_PARALLEL:-1}"
+VISION_LOCK_WAIT="${VISION_LOCK_WAIT:-60}"
+VISION_SYSTEM_PROMPT="You are an expert vision analyst. Your job is to analyze images with surgical precision and return an exhaustive, structured report tailored EXACTLY to the user's question.
+
+RULES:
+1. Answer ONLY what was asked, but answer it completely, leaving zero ambiguity.
+2. Structure your response: use clear sections, bullet points for lists, and be specific (coordinates, colors, sizes, values; never vague).
+3. For UI/screenshots: identify every element, layout pattern, spacing, alignment issues, color usage, typography, and interaction states. Propose concrete fixes with exact CSS values.
+4. For code screenshots: read every line you can see. Quote exact variable names, function signatures, error messages.
+5. For photos: describe subjects, composition, lighting direction, colors (hex when relevant), mood, depth of field, technical observations.
+6. For diagrams/charts: extract ALL data points, labels, axes, trends, outliers. Be quantitative.
+7. For documents/text: transcribe every word you can read. Preserve formatting.
+8. Always end with an \"Actionable Insights\" section: what the user should DO with this information.
+9. If the image is ambiguous, state your assumptions clearly rather than guessing silently.
+10. Match the tone and technical depth to the user's question. If they ask like an engineer, answer like one.
+
+You are the eyes for an AI that cannot see. Be its perfect visual cortex."
+
+# --- parse args: vision <img> [<img>...] -- <prompt> | vision <img> <prompt> ---
+if [[ $# -lt 2 ]]; then
+    echo "usage: vision <image> [<image>...] -- <prompt>" >&2
+    echo "       vision <image> <prompt>        (legacy single-image)" >&2
+    exit 1
+fi
+
+SEP=0
+for _a in "$@"; do
+    if [[ "$_a" == "--" ]]; then SEP=1; break; fi
+done
+
+IMAGES=()
+PROMPT_WORDS=()
+if (( SEP )); then
+    _seen=0
+    for _a in "$@"; do
+        if [[ "$_a" == "--" ]]; then _seen=1; continue; fi
+        if (( _seen )); then PROMPT_WORDS+=("$_a"); else IMAGES+=("$_a"); fi
+    done
+else
+    IMAGES=("$1")
+    shift
+    PROMPT_WORDS=("$@")
+fi
+
+if [[ ${#IMAGES[@]} -lt 1 ]]; then
+    echo "vision: au moins une image requise" >&2
+    exit 1
+fi
+
+# Prompt from arg or stdin
+if [[ ${#PROMPT_WORDS[@]} -eq 1 && "${PROMPT_WORDS[1]}" == "-" ]]; then
+    PROMPT="$(cat)"
+else
+    PROMPT="${PROMPT_WORDS[*]}"
+fi
+if [[ -z "$PROMPT" ]]; then
+    echo "vision: empty prompt" >&2
+    exit 1
+fi
+
+# --- verrou de concurrence (anti fan-out) : POOL de VISION_MAX_PARALLEL slots ---
+# Pool partage entre tous les appels vision (meme repertoire de locks) :
+# le nombre d'appels Luna simultanes est borne, pas de fan-out sauvage
+# (incident 2026-08-08). Defaut VISION_MAX_PARALLEL=1 = ancien comportement.
+LOCK_DIR="/tmp/vision.locks"
+mkdir -p "$LOCK_DIR"
+ACQUIRED=0
+LOCK_FILE=""
+_cleanup_lock() { [[ "$ACQUIRED" == "1" && -n "$LOCK_FILE" ]] && rm -f "$LOCK_FILE"; }
+
+# shlock ne reclame JAMAIS un lock stale (PID mort), on le fait a la main :
+# si le slot existe avec un PID mort, on le supprime et on reessaie.
+# Un process tue (SIGKILL) laisserait sinon un slot bloque a vie.
+_check_stale() {
+    # TOUJOURS return 0 : le `return` nu rendrait le status du [[ -f ]] (1)
+    # et `set -e` tuerait le script.
+    [[ -f "$1" ]] || return 0
+    local _lp
+    _lp="$(cat "$1" 2>/dev/null)"
+    if [[ ! "$_lp" =~ ^[0-9]+$ ]]; then rm -f "$1"; return 0; fi
+    if kill -0 "$_lp" 2>/dev/null; then return 0; fi
+    rm -f "$1"
+    return 0
+}
+
+_waited=0
+while true; do
+    # essaie d'attraper n'importe quel slot libre
+    for ((_i=0; _i<VISION_MAX_PARALLEL; _i++)); do
+        _try="$LOCK_DIR/vision.lock.$_i"
+        _check_stale "$_try"
+        if shlock -f "$_try" -p "$$" 2>/dev/null; then
+            LOCK_FILE="$_try"
+            ACQUIRED=1
+            break 2
+        fi
+    done
+    _waited=$((_waited + 1))
+    if [[ $_waited -ge $VISION_LOCK_WAIT ]]; then
+        echo "vision: ${VISION_MAX_PARALLEL} appel(s) deja en cours depuis >${VISION_LOCK_WAIT}s, abandon (relance plus tard)" >&2
+        exit 75
+    fi
+    sleep 1
+done
+
+# --- conversion des images non attachables (HEIC/HEIF surtout) + multi ---
+ATTACH=()
+TMP_ATTACHES=()
+for _img in "${IMAGES[@]}"; do
+    if [[ ! -f "$_img" ]]; then
+        echo "vision: file not found: $_img" >&2
+        _cleanup_lock
+        exit 1
+    fi
+    _img="$(realpath "$_img")"
+    EXT="${_img:e:l}"
+    case "$EXT" in
+        png|jpg|jpeg|webp|gif) ATTACH+=("$_img") ;;
+        *)
+            _tmp="$(mktemp -t visionimg).png"
+            if ! sips -s format png "$_img" --out "$_tmp" >/dev/null 2>&1; then
+                echo "vision: conversion impossible de $_img (extension .$EXT)" >&2
+                _cleanup_lock
+                exit 1
+            fi
+            ATTACH+=("$_tmp")
+            TMP_ATTACHES+=("$_tmp")
+            ;;
+    esac
+done
+
+# --- appel GPT 5.6 Luna DIRECT au proxy (base64 data URL) ---
+# opencode CLI est single-flight (2 invocations paralleles = HANG, verifie
+# 2026-08-09) ; le proxy gere la concurrence (2 curls paralleles OK).
+# => appel HTTP direct : le pool de slots sert vraiment, Luna reste un juge
+# pur (zero tools, zero acces fichiersysteme). Bonus : usage API reel ecrit
+# dans $VISION_USAGE_FILE si pose (telemetry).
+FULL_PROMPT="${VISION_SYSTEM_PROMPT}
+
+---
+
+USER QUESTION: ${PROMPT}"
+
+OUT="$(mktemp -t visionout)"
+PYSRC="$(mktemp -t visionpy)"
+
+trap '_cleanup_lock; for _t in "${TMP_ATTACHES[@]}"; do rm -f "$_t"; done; rm -f "$OUT" "$PYSRC"' EXIT
+
+cat > "$PYSRC" <<'PYEOF'
+import base64, json, os, signal, sys, urllib.request
+model, *images = sys.argv[1:]
+prompt = sys.stdin.read()
+timeout = float(os.environ.get("VISION_TIMEOUT", "120"))
+def _on_timeout(*_):
+    sys.stderr.write("[vision] timeout apres %ds, appel interrompu\n" % timeout)
+    os._exit(124)
+signal.signal(signal.SIGALRM, _on_timeout)
+signal.alarm(max(1, int(timeout)))
+base = os.environ.get("VISION_BASE_URL", "http://127.0.0.1:10100")
+auth = os.environ.get("VISION_AUTH", "local")
+content = [{"type": "text", "text": prompt}]
+for p in images:
+    ext = "png" if p.lower().endswith(".png") else "jpeg"
+    b64 = base64.b64encode(open(p, "rb").read()).decode()
+    content.append({"type": "image_url",
+                    "image_url": {"url": "data:image/%s;base64,%s" % (ext, b64)}})
+body = {"model": model,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 4000}
+req = urllib.request.Request(base + "/v1/chat/completions",
+    data=json.dumps(body).encode(),
+    headers={"Content-Type": "application/json", "Authorization": "Bearer " + auth})
+out = json.load(urllib.request.urlopen(req, timeout=timeout))
+if "VISION_USAGE_FILE" in os.environ and out.get("usage"):
+    open(os.environ["VISION_USAGE_FILE"], "w").write(json.dumps(out["usage"]))
+sys.stdout.write(out["choices"][0]["message"]["content"])
+PYEOF
+
+STATUS=0
+VISION_TIMEOUT="$VISION_TIMEOUT" python3 "$PYSRC" "$VISION_MODEL" "${ATTACH[@]}" \
+    >"$OUT" 2>/dev/null <<EOF || STATUS=$?
+$FULL_PROMPT
+EOF
+
+if (( STATUS != 0 )); then
+    cat "$OUT" >&2
+    echo "vision: appel Luna direct echoue (exit $STATUS) : transport, pas un verdict" >&2
+    exit $STATUS
+fi
+cat "$OUT"
+exit 0

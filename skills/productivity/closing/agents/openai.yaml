@@ -1,0 +1,5 @@
+interface:
+  display_name: "Closing"
+  short_description: "Wrap up a session before closing it"
+policy:
+  allow_implicit_invocation: false

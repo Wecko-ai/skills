@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""office-watch: live pixel-office view of /office agents in the terminal.
+
+Reads the same state files as the statusline (~/.claude/office-logs/active/*.json)
+and renders a Game Boy-ish sepia office: one desk per roster agent, occupied desks
+show the worker typing with their task + live action, empty desks sit in the dark.
+
+Run it in a split pane next to your Claude Code session:  office-watch
+Options:  --all  show agents from every session (default: only this terminal's
+          claude ancestor session, same ownership walk as the statusline; if no
+          claude ancestor is found, shows all).
+Quit: q or Ctrl-C.
+"""
+
+import json, os, sys, time, glob, subprocess, signal
+
+ACTIVE_DIR = os.path.expanduser("~/.claude/office-logs/active")
+ROSTER = [  # (key, code, name, model-short)
+    ("lead",  "tnk", "Tanaka", "qwen3.8-max"),
+    ("ds",    "suz", "Suzuki", "ds-v4-flash"),
+    ("glm",   "ken", "Kenji",  "glm-5.2"),
+    ("k2",    "yuk", "Yuki",   "kimi-coding"),
+    ("flash", "hay", "Hayate", "qwen3.6-flash"),
+]
+
+# sepia palette (256-color)
+C_FLOOR1  = "\x1b[38;5;137m"   # tan
+C_FLOOR2  = "\x1b[38;5;95m"    # darker tan
+C_DESK    = "\x1b[38;5;180m"   # cream
+C_SCREEN  = "\x1b[38;5;229m"   # glowing screen
+C_SCREENB = "\x1b[38;5;223m"   # screen blink frame
+C_BODY    = "\x1b[38;5;130m"   # worker
+C_DIM     = "\x1b[38;5;59m"    # empty desk / off text
+C_CODE    = "\x1b[38;5;175m"   # agent code (magenta-ish)
+C_TIME    = "\x1b[38;5;116m"   # elapsed (cyan-ish)
+C_TASK    = "\x1b[38;5;187m"   # task text
+C_ACT     = "\x1b[38;5;101m"   # action text
+C_TITLE   = "\x1b[38;5;223m"
+R = "\x1b[0m"
+
+def claude_ancestor(pid):
+    """Walk up the process tree to the owning claude process, else 0."""
+    p = pid
+    for _ in range(10):
+        try:
+            out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(p)],
+                                 capture_output=True, text=True, timeout=2).stdout.strip()
+            if not out:
+                return 0
+            ppid_s, _, comm = out.partition(" ")
+            p = int(ppid_s.strip())
+        except Exception:
+            return 0
+        if p <= 1:
+            return 0
+        if "claude" in comm.strip().rsplit("/", 1)[-1]:
+            return p
+    return 0
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+def read_agents(my_claude, show_all):
+    agents = {}
+    for f in glob.glob(os.path.join(ACTIVE_DIR, "*.json")):
+        try:
+            d = json.load(open(f))
+        except Exception:
+            continue
+        pid = int(d.get("pid") or 0)
+        if not pid or not pid_alive(pid):
+            continue
+        boss = int(d.get("boss") or 0) or claude_ancestor(pid)
+        if not show_all and my_claude and boss and boss != my_claude:
+            continue
+        agents[d.get("agent", "?")] = d
+    return agents
+
+def elapsed_str(start):
+    e = max(0, int(time.time()) - int(start))
+    if e < 60: return f"{e}s"
+    if e < 3600: return f"{e//60}m{e%60:02d}s"
+    return f"{e//3600}h{(e%3600)//60:02d}m"
+
+def trim(s, w):
+    s = (s or "").strip()
+    return s if len(s) <= w else s[:w-1] + "…"
+
+DESK_W = 26  # per-desk cell width
+
+def desk_lines(entry, roster_row, frame):
+    key, code, name, model = roster_row
+    if entry:
+        blink = C_SCREEN if frame % 2 == 0 else C_SCREENB
+        hands = "▄▖▄" if frame % 2 == 0 else "▄▗▄"
+        screen = f"{C_DESK}┌─{blink}▓▓▓▓{C_DESK}─┐"
+        head   = f"{C_DESK}│ {C_BODY} ◉◉ {C_DESK} │"
+        desk   = f"{C_DESK}└┬─{C_BODY}{hands}{C_DESK}─┬┘"
+        label  = f"{C_CODE}{code}{R} {C_TIME}{elapsed_str(entry.get('start', time.time()))}{R} {C_DIM}{name}{R}"
+        task   = f"{C_TASK}{trim(entry.get('task',''), DESK_W-2)}{R}"
+        act    = f"{C_ACT}› {trim(entry.get('action',''), DESK_W-4)}{R}"
+    else:
+        screen = f"{C_DIM}┌─▒▒▒▒─┐"
+        head   = f"{C_DIM}│      │"
+        desk   = f"{C_DIM}└┬────┬┘"
+        label  = f"{C_DIM}{code} {name} zzz{R}"
+        task   = ""
+        act    = ""
+    return [screen + R, head + R, desk + R, label, task, act]
+
+def pad_visible(s, w):
+    """Pad string to visible width w (ignores ANSI escapes)."""
+    import re
+    vis = len(re.sub(r"\x1b\[[0-9;]*m", "", s))
+    return s + " " * max(0, w - vis)
+
+def render(agents, cols, frame, show_all, my_claude):
+    lines = []
+    t = time.strftime("%H:%M:%S")
+    scope = "all sessions" if show_all or not my_claude else f"session {my_claude}"
+    n = len(agents)
+    title = f"{C_TITLE} OFFICE {R}{C_DIM}· {n} agent{'s' if n != 1 else ''} · {scope} · {t}{R}"
+    lines.append(title)
+    lines.append("")
+    per_row = max(1, min(len(ROSTER), (cols - 2) // DESK_W))
+    for i in range(0, len(ROSTER), per_row):
+        chunk = ROSTER[i:i+per_row]
+        cells = [desk_lines(agents.get(r[0]), r, frame) for r in chunk]
+        for li in range(6):
+            row = "  ".join(pad_visible(c[li], DESK_W) for c in cells)
+            lines.append("  " + row)
+        # floor strip between desk rows
+        floor = ""
+        for x in range((per_row * (DESK_W + 2)) // 2):
+            floor += (C_FLOOR1 if (x + i + frame // 4) % 2 == 0 else C_FLOOR2) + "▚"
+        lines.append("  " + floor + R)
+    lines.append("")
+    lines.append(f"  {C_DIM}q quit · state: ~/.claude/office-logs/active/{R}")
+    return "\n".join(lines)
+
+def main():
+    show_all = "--all" in sys.argv
+    my_claude = claude_ancestor(os.getpid())
+    if not my_claude:
+        show_all = True
+    # alt screen + hide cursor
+    sys.stdout.write("\x1b[?1049h\x1b[?25l")
+    # non-blocking q
+    import termios, tty, select
+    fd = sys.stdin.fileno()
+    old = None
+    try:
+        old = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    except Exception:
+        pass
+
+    def restore(*_):
+        if old:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\x1b[?25h\x1b[?1049l")
+        sys.stdout.flush()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, restore)
+    signal.signal(signal.SIGTERM, restore)
+
+    frame = 0
+    while True:
+        cols = os.get_terminal_size().columns
+        agents = read_agents(my_claude, show_all)
+        sys.stdout.write("\x1b[H\x1b[2J" + render(agents, cols, frame, show_all, my_claude) + "\n")
+        sys.stdout.flush()
+        if select.select([sys.stdin], [], [], 0.5)[0]:
+            if sys.stdin.read(1).lower() == "q":
+                restore()
+        frame += 1
+
+if __name__ == "__main__":
+    main()

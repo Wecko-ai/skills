@@ -1,0 +1,21 @@
+#!/bin/bash
+# codex-notify-wrapper: called by Codex (notify in config.toml).
+# Optionally forwards to an existing notifier (e.g. SkyComputerUseClient) and
+# always fires the kage-agent-notify ping.
+#
+# Codex passes the event JSON as the last argument.
+#
+# Set KAGE_CODEX_FORWARD to a binary path to also forward the event there:
+#   export KAGE_CODEX_FORWARD="/path/to/SkyComputerUseClient"
+
+if [ -n "$KAGE_CODEX_FORWARD" ] && [ -x "$KAGE_CODEX_FORWARD" ]; then
+  "$KAGE_CODEX_FORWARD" "$@" &
+fi
+
+# Prefer the copy next to this wrapper, fall back to PATH.
+here="$(cd "$(dirname "$0")" && pwd)"
+notify="$here/kage-agent-notify"
+[ -x "$notify" ] || notify="kage-agent-notify"
+
+"$notify" codex "${@: -1}" &
+exit 0

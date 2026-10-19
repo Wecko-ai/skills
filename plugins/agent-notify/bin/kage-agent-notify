@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""kage-agent-notify: phone ping when Claude Code / Codex finishes, only when you're away.
+
+Only notifies when you are AWAY from the Mac: if the screen is unlocked and
+you touched keyboard/mouse in the last KAGE_NOTIFY_IDLE_SKIP_SEC seconds,
+the notification is silently skipped. Screen locked = away = always notify.
+
+Claude Code fires `Stop` at the end of every turn, even while background agents,
+teammates, shells or workflows are still running. The hook payload lists that
+in-flight work (`background_tasks`, `session_crons`), so claude-stop stays quiet
+until the final Stop, when the session is really idle.
+
+Usage:
+  kage-agent-notify claude-stop    # Claude Code Stop hook, JSON on stdin
+  kage-agent-notify claude-end     # Claude Code SessionEnd hook, JSON on stdin
+  kage-agent-notify codex '<json>' # Codex notify event JSON as argv[2]
+
+Debounce: at most one notification per source every DEBOUNCE_SEC seconds
+(except claude-end, which is always sent when away).
+
+Environment:
+  KAGE_NOTIFY_SEND_CMD       Command used to deliver the message (required). The
+                             message is appended as the last argument. Examples:
+                               "ntfy publish my-secret-topic"
+                               "hermes -p <profile> send --to telegram -q"
+  KAGE_NOTIFY_FORCE=1        Bypass the presence check (testing).
+  KAGE_NOTIFY_IDLE_SKIP_SEC  Idle threshold in seconds (default 180).
+  KAGE_NOTIFY_DEBUG=1        Keep the last Stop payload of each session in
+                             ~/.cache/kage-agent-notify/last-stop-<id>.json.
+"""
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+
+STATE_DIR = os.path.expanduser("~/.cache/kage-agent-notify")
+DEBOUNCE_SEC = 90
+IDLE_SKIP_SEC = int(os.environ.get("KAGE_NOTIFY_IDLE_SKIP_SEC", "180"))
+SEND_CMD = shlex.split(os.environ.get("KAGE_NOTIFY_SEND_CMD", ""))
+
+TERMINAL_STATUSES = {"completed", "failed", "killed", "stopped", "cancelled"}
+IDLE_STOP_REASONS = {"end_turn", "stop_sequence"}
+
+
+def _idle_seconds() -> float:
+    """Seconds since last keyboard/mouse input (IOHIDSystem, macOS)."""
+    try:
+        out = subprocess.run(
+            ["ioreg", "-c", "IOHIDSystem", "-d", "4"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        for line in out.splitlines():
+            if "HIDIdleTime" in line:
+                return int(line.rsplit("=", 1)[1].strip()) / 1_000_000_000
+    except Exception:
+        pass
+    return 0.0
+
+
+def _screen_locked() -> bool:
+    try:
+        import Quartz  # present on some macOS pythons
+        d = Quartz.CGSessionCopyCurrentDictionary()
+        return bool(d and d.get("CGSSessionScreenIsLocked"))
+    except Exception:
+        pass
+    # Fallback: when the session is locked, the frontmost app is loginwindow.
+    try:
+        out = subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to get name of first process whose frontmost is true'],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        return out == "loginwindow"
+    except Exception:
+        return False
+
+
+def user_is_present() -> bool:
+    """True = user is at the Mac -> do not spam the phone."""
+    if _screen_locked():
+        return False
+    return _idle_seconds() < IDLE_SKIP_SEC
+
+
+def _last_turn_record(path: str):
+    """Last user/assistant record of a transcript jsonl, read backwards in chunks."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            chunk, pos, buf = 256 * 1024, size, b""
+            while pos > 0 and size - pos < 16 * 1024 * 1024:
+                step = min(chunk, pos)
+                pos -= step
+                fh.seek(pos)
+                buf = fh.read(step) + buf
+                lines = buf.split(b"\n")
+                # The first line may be cut until we reach the start of the file.
+                for raw in reversed(lines if pos == 0 else lines[1:]):
+                    try:
+                        rec = json.loads(raw)
+                    except Exception:
+                        continue
+                    if rec.get("type") in ("user", "assistant"):
+                        return rec
+    except OSError:
+        pass
+    return None
+
+
+def _teammate_idle(task: dict, subagents_dir: str) -> bool:
+    """A teammate stays status=running while idle (it waits on its mailbox).
+    Idle = its transcript ends on a closed assistant message (end_turn), not on a
+    tool call in flight. The task is matched to its transcript by description."""
+    desc = task.get("description")
+    if not desc or not os.path.isdir(subagents_dir):
+        return False
+    best = None
+    for name in os.listdir(subagents_dir):
+        if not name.endswith(".meta.json"):
+            continue
+        try:
+            with open(os.path.join(subagents_dir, name)) as fh:
+                if json.load(fh).get("description") != desc:
+                    continue
+        except Exception:
+            continue
+        jsonl = os.path.join(subagents_dir, name[: -len(".meta.json")] + ".jsonl")
+        if os.path.exists(jsonl) and (best is None or os.path.getmtime(jsonl) > os.path.getmtime(best)):
+            best = jsonl
+    if best is None:
+        return False
+    rec = _last_turn_record(best)
+    if not rec or rec.get("type") != "assistant":
+        return False
+    return (rec.get("message") or {}).get("stop_reason") in IDLE_STOP_REASONS
+
+
+def _is_log_watcher(task: dict) -> bool:
+    """`tail -f/-F ...` is an observer that never ends on its own, not work."""
+    cmd = (task.get("command") or "").strip()
+    return cmd.startswith("tail ") and any(f in cmd.split("|")[0].split() for f in ("-f", "-F"))
+
+
+def still_busy(data: dict) -> bool:
+    """True if the Stop payload reports background work still in flight
+    (`background_tasks`, Claude Code 2.1.30x+) or armed session crons.
+    Older versions send neither field: never busy, notify as before."""
+    tp = data.get("transcript_path") or ""
+    subagents_dir = os.path.join(tp[: -len(".jsonl")], "subagents") if tp.endswith(".jsonl") else ""
+    for t in data.get("background_tasks") or []:
+        if not isinstance(t, dict):
+            return True
+        if t.get("status") in TERMINAL_STATUSES or _is_log_watcher(t):
+            continue
+        if t.get("type") == "teammate" and _teammate_idle(t, subagents_dir):
+            continue
+        return True
+    return bool(data.get("session_crons"))
+
+
+def shorten_path(p: str) -> str:
+    home = os.path.expanduser("~")
+    if p.startswith(home):
+        p = "~" + p[len(home):]
+    return p
+
+
+def debounce_ok(key: str) -> bool:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    f = os.path.join(STATE_DIR, key.replace("/", "_"))
+    now = time.time()
+    try:
+        last = os.path.getmtime(f)
+        if now - last < DEBOUNCE_SEC:
+            return False
+    except FileNotFoundError:
+        pass
+    open(f, "w").close()
+    os.utime(f, (now, now))
+    return True
+
+
+def send(msg: str) -> None:
+    if not SEND_CMD:
+        print("kage-agent-notify: KAGE_NOTIFY_SEND_CMD is not set, nothing sent", file=sys.stderr)
+        return
+    subprocess.Popen(
+        SEND_CMD + [msg],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def fmt_time() -> str:
+    return time.strftime("%H:%M")
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("usage: kage-agent-notify claude-stop|claude-end|codex [json]", file=sys.stderr)
+        return 2
+
+    mode = sys.argv[1]
+
+    data = {}
+    if mode in ("claude-stop", "claude-end"):
+        try:
+            data = json.load(sys.stdin)
+        except Exception:
+            data = {}
+
+    if mode == "claude-stop":
+        if os.environ.get("KAGE_NOTIFY_DEBUG"):
+            try:
+                os.makedirs(STATE_DIR, exist_ok=True)
+                sid8 = (data.get("session_id") or "x")[:8]
+                with open(os.path.join(STATE_DIR, f"last-stop-{sid8}.json"), "w") as fh:
+                    json.dump(data, fh, indent=1)
+            except Exception:
+                pass
+        # End of a turn is not the end of the session: wait for the last Stop.
+        if still_busy(data):
+            return 0
+
+    if mode in ("claude-stop", "claude-end", "codex"):
+        if not os.environ.get("KAGE_NOTIFY_FORCE") and user_is_present():
+            return 0
+
+    if mode in ("claude-stop", "claude-end"):
+        cwd = shorten_path(data.get("cwd") or os.getcwd())
+        sid = (data.get("session_id") or "x")[:8]
+
+        if mode == "claude-stop":
+            if not debounce_ok(f"claude-stop-{sid}"):
+                return 0
+            send(f"✅ Claude Code finished ({fmt_time()})\n📁 {cwd}")
+        else:
+            reason = data.get("reason", "")
+            extra = f" ({reason})" if reason else ""
+            send(f"👋 Claude Code session closed{extra} ({fmt_time()})\n📁 {cwd}")
+        return 0
+
+    if mode == "codex":
+        raw = sys.argv[2] if len(sys.argv) > 2 else "{}"
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {}
+        if data.get("type") and data["type"] != "agent-turn-complete":
+            return 0
+        if not debounce_ok("codex-turn"):
+            return 0
+        last = (data.get("last-assistant-message") or "").strip().replace("\n", " ")
+        if len(last) > 140:
+            last = last[:137] + "..."
+        msg = f"✅ Codex finished its turn ({fmt_time()})"
+        if last:
+            msg += f"\n💬 {last}"
+        send(msg)
+        return 0
+
+    print(f"unknown mode: {mode}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

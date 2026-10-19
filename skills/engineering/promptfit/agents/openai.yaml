@@ -1,0 +1,5 @@
+interface:
+  display_name: "Promptfit"
+  short_description: "Scope a vague request into a ticket via a local LLM"
+policy:
+  allow_implicit_invocation: false

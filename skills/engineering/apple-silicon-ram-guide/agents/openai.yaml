@@ -1,0 +1,3 @@
+interface:
+  display_name: "Apple Silicon RAM Guide"
+  short_description: "Will this local LLM fit in my Mac's unified memory?"

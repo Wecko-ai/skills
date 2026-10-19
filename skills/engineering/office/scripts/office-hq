@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""office-hq: localhost dashboard for /office agents.
+
+Serves a sepia pixel-office page showing every running agent (desk, task, live
+action, elapsed) plus the recent runs feed. Reads the same state files as the
+statusline and office-watch: ~/.claude/office-logs/active/*.json + runs.jsonl.
+
+Usage:  office-hq [--port 4545]        (foreground)
+        office-hq --daemon             (background, prints URL, exits)
+Stop:   office-hq --stop
+The /office skill starts it automatically when the mode is activated.
+"""
+
+import json, os, sys, time, glob, subprocess, signal, socket
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+PORT = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 4545
+LOG_DIR = os.path.expanduser("~/.claude/office-logs")
+ACTIVE_DIR = os.path.join(LOG_DIR, "active")
+RUNS = os.path.join(LOG_DIR, "runs.jsonl")
+PIDFILE = os.path.join(LOG_DIR, "office-hq.pid")
+_HERE = os.path.dirname(os.path.realpath(__file__))
+_ASSET_CANDIDATES = [
+    os.path.expanduser("~/.claude/office-hq-assets"),
+    os.path.join(_HERE, "..", "assets", "hq"),   # skill layout: office/scripts/ + office/assets/hq/
+    os.path.join(_HERE, "assets", "hq"),
+]
+ASSETS_DIR = next((d for d in _ASSET_CANDIDATES if os.path.isdir(d)), _ASSET_CANDIDATES[0])
+
+ROSTER = [
+    ("lead",  "tnk", "Tanaka", "qwen3.8-max-preview"),
+    ("ds",    "suz", "Suzuki", "deepseek-v4-flash-0731"),
+    ("glm",   "ken", "Kenji",  "glm-5.2"),
+    ("k2",    "yuk", "Yuki",   "kimi-for-coding"),
+    ("flash", "hay", "Hayate", "qwen3.6-flash"),
+]
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0); return True
+    except Exception:
+        return False
+
+def claude_ancestor(pid):
+    p = pid
+    for _ in range(10):
+        try:
+            out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(p)],
+                                 capture_output=True, text=True, timeout=2).stdout.strip()
+            if not out: return 0
+            ppid_s, _, comm = out.partition(" ")
+            p = int(ppid_s.strip())
+        except Exception:
+            return 0
+        if p <= 1: return 0
+        if "claude" in comm.strip().rsplit("/", 1)[-1]: return p
+    return 0
+
+def state():
+    agents = []
+    for f in glob.glob(os.path.join(ACTIVE_DIR, "*.json")):
+        try: d = json.load(open(f))
+        except Exception: continue
+        pid = int(d.get("pid") or 0)
+        if not pid or not pid_alive(pid): continue
+        d["boss"] = int(d.get("boss") or 0) or claude_ancestor(pid)
+        agents.append(d)
+    recent = []
+    try:
+        lines = open(RUNS).readlines()[-12:]
+        for ln in reversed(lines):
+            try: recent.append(json.loads(ln))
+            except Exception: pass
+    except Exception:
+        pass
+    return {"agents": agents, "recent": recent, "roster": ROSTER, "now": int(time.time())}
+
+PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>OFFICE HQ</title>
+<style>
+:root{--bg:#15110c;--cream:#e3cf9c;--tan:#9c7b50;--dim:#6b5d45;--mag:#c586b6;--cyan:#7fb8c9;--ok:#8aa86b;--err:#c96a5a}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--cream);font:13px/1.5 "SF Mono",Menlo,monospace;padding:22px;display:flex;flex-direction:column;align-items:center}
+.wrap{width:100%;max-width:980px}
+h1{font-size:15px;letter-spacing:5px;color:var(--cream);margin-bottom:2px}
+.sub{color:var(--dim);font-size:11px;margin-bottom:14px}
+canvas{width:100%;image-rendering:pixelated;border:2px solid #2a2118;border-radius:3px;display:block;background:#0f0c08}
+.list{margin-top:14px}
+.row{display:flex;gap:8px;align-items:baseline;padding:3px 2px;font-size:12.5px;white-space:nowrap;overflow:hidden}
+.row .code{color:var(--mag);font-weight:700;min-width:30px}
+.row .t{color:var(--cyan);min-width:56px}
+.row .task{color:var(--cream);overflow:hidden;text-overflow:ellipsis}
+.row .act{color:var(--tan);overflow:hidden;text-overflow:ellipsis}
+.row .act:before{content:" › ";color:var(--dim)}
+.row .sess{color:var(--dim);font-size:10px}
+.row.zz{color:var(--dim)}.row.zz .code{color:var(--dim)}
+h2{font-size:11px;letter-spacing:3px;color:var(--tan);margin:22px 0 8px}
+.run{display:flex;gap:10px;padding:4px 8px;border-left:2px solid #2a2118;margin-bottom:3px;font-size:11.5px;color:var(--dim)}
+.run .ok{color:var(--ok)}.run .err{color:var(--err)}
+.run .a{color:var(--mag);min-width:40px}.run .p{color:var(--cream);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+</style></head><body><div class="wrap">
+<h1>OFFICE HQ</h1><div class="sub" id="sub">…</div>
+<canvas id="cv" width="2048" height="1650"></canvas>
+<div class="list" id="list"></div>
+<h2>RECENT RUNS</h2><div id="runs"></div>
+</div>
+<script>
+const cv=document.getElementById("cv"),ctx=cv.getContext("2d");
+ctx.imageSmoothingEnabled=false;
+const IMGS={};
+for(const n of ["room","spr_typing","spr_sleep","spr_typing_b","spr_coffee","spr_boss"]){
+  const i=new Image();i.src="/assets/"+n+".png";IMGS[n]=i;
+}
+// slots: worker anchor = (cx = sprite center x, fy = sprite bottom y)
+const SLOTS=[
+ {k:"lead", cx:290, fy:882,  flip:false, typ:"spr_typing",  slp:"spr_sleep"},
+ {k:"ds",   cx:640, fy:882,  flip:true,  typ:"spr_typing_b",slp:"spr_sleep"},
+ {k:"glm",  cx:290, fy:1594, flip:false, typ:"spr_typing_b",slp:"spr_sleep"},
+ {k:"k2",   cx:640, fy:1594, flip:true,  typ:"spr_typing",  slp:"spr_sleep"},
+ {k:"flash",cx:1445,fy:1594, flip:false, typ:"spr_typing",  slp:"spr_sleep"}
+];
+// screen rects [x,y,w,h] are re-measured below; scr coords set after first render pass
+const SCREENS={lead:[196,310,270,200],ds:[900,310,270,200],glm:[212,1190,265,195],k2:[1035,1190,265,195],flash:[2000,0,0,0]};
+const COFFEE={x:1810,fy:700};      // standing spot in front of the machine
+const BOSS={y:1120,x0:420,x1:1560};
+const CODES={lead:"tnk",ds:"suz",glm:"ken",k2:"yuk",flash:"hay"};
+const NAMES={lead:"Tanaka",ds:"Suzuki",glm:"Kenji",k2:"Yuki",flash:"Hayate"};
+let state={agents:[],recent:[],now:0},drift=0,frame=0;
+let bossX=800,bossDir=1;
+// per-slot coffee-break machine: {phase:null|"go"|"drink"|"back", t, x}
+const breaks={};
+function rand(a,b){return a+Math.random()*(b-a)}
+function active(k){return state.agents.some(a=>a.agent==k)}
+function draw(){
+  if(!IMGS.room.complete||IMGS.room.naturalWidth==0)return;
+  ctx.clearRect(0,0,2048,1650);
+  ctx.drawImage(IMGS.room,0,0);
+  const anyOn=state.agents.length>0;
+  // steam over the coffee machine cup (machine ~x1730-2020, cup ~y400)
+  if(anyOn){const f=frame%4;
+    px(1836,430-f*26,14,"#efe0ae");px(1876,400-((frame+2)%4)*26,12,"#e3cf9c");}
+  for(const s of SLOTS){
+    const on=active(s.k);
+    const br=breaks[s.k];
+    if(on&&!br&&Math.random()<0.0012)breaks[s.k]={phase:"go",t:frame};
+    if(br)stepBreak(s,br);
+    if(on&&(!br||br.phase==null)){
+      const dy=(frame%2)*5;
+      const im=pick(s.typ);
+      blit(im,s.cx,s.fy+dy,s.flip);
+      bubble(s.cx,s.fy-im.height);
+    }else if(!on){
+      const dy=(frame%4<2)?0:4;
+      const im=pick(s.slp);
+      blit(im,s.cx,s.fy+dy,s.flip);
+      zzz(s.cx+im.width/2+12,s.fy-im.height+52);
+    }
+  }
+  // boss paces while the office works
+  if(anyOn){
+    bossX+=bossDir*7;if(bossX>BOSS.x1)bossDir=-1;if(bossX<BOSS.x0)bossDir=1;
+    const im=IMGS.spr_boss,bob=(frame%2)*5;
+    ctx.save();
+    if(bossDir<0){ctx.translate(bossX+im.width/2,0);ctx.scale(-1,1);ctx.translate(-(bossX+im.width/2),0)}
+    ctx.drawImage(im,bossX-im.width/2,BOSS.y-im.height+bob);
+    ctx.restore();
+  }
+}
+function stepBreak(s,br){
+  const im=IMGS.spr_coffee,el=frame-br.t;
+  if(br.phase=="go"){
+    const p=Math.min(1,el/14);
+    const x=s.cx+(COFFEE.x-s.cx)*p, y=s.fy+(COFFEE.fy-s.fy)*p;
+    ctx.drawImage(im,x-im.width/2,y-im.height+(frame%2)*5);
+    if(p>=1){br.phase="drink";br.t=frame}
+  }else if(br.phase=="drink"){
+    ctx.drawImage(im,COFFEE.x-im.width/2,COFFEE.fy-im.height);
+    const f=frame%3;px(COFFEE.x+40,COFFEE.fy-im.height-14-f*16,10,"#efe0ae");
+    if(el>26){br.phase="back";br.t=frame}
+  }else if(br.phase=="back"){
+    const p=Math.min(1,el/14);
+    const x=COFFEE.x+(s.cx-COFFEE.x)*p, y=COFFEE.fy+(s.fy-COFFEE.fy)*p;
+    ctx.save();
+    ctx.translate(x,0);ctx.scale(-1,1);ctx.translate(-x,0);
+    ctx.drawImage(im,x-im.width/2,y-im.height+(frame%2)*5);
+    ctx.restore();
+    if(p>=1)delete breaks[s.k];
+  }
+}
+function pick(n){const i=IMGS[n];return (i&&i.complete&&i.naturalWidth>0)?i:IMGS.spr_typing}
+function blit(im,cx,fy,flip){
+  if(!im.complete||im.naturalWidth==0)return;
+  ctx.save();
+  if(flip){ctx.translate(cx,0);ctx.scale(-1,1);ctx.translate(-cx,0)}
+  ctx.drawImage(im,cx-im.width/2,fy-im.height);
+  ctx.restore();
+}
+function px(x,y,sz,c){ctx.fillStyle=c;ctx.fillRect(x,y,sz,sz)}
+function dark(r){if(!r)return;ctx.fillStyle="rgba(20,14,8,0.55)";ctx.fillRect(r[0],r[1],r[2],r[3])}
+function bubble(cx,headTop){
+  const w=68,h=36,x=cx-w/2,y=headTop-h-26;
+  ctx.fillStyle="#241c12";ctx.fillRect(x-4,y-4,w+8,h+8);
+  ctx.fillStyle="#e3cf9c";ctx.fillRect(x,y,w,h);
+  ctx.fillStyle="#241c12";ctx.fillRect(cx-8,y+h+4,16,8);
+  ctx.fillStyle="#e3cf9c";ctx.fillRect(cx-5,y+h,10,8);
+  const dots=frame%3+1;ctx.fillStyle="#241c12";
+  for(let i=0;i<dots;i++)ctx.fillRect(x+12+i*18,y+14,9,9);
+}
+function zGlyph(x,y,s){
+  ctx.fillStyle="#241c12";ctx.fillRect(x-2,y-2,s*5+4,s*7+4);
+  ctx.fillStyle="#f2e4b6";
+  ctx.fillRect(x,y,s*5,s);ctx.fillRect(x,y+s*6,s*5,s);
+  ctx.fillRect(x+s*3,y+s,s,s);ctx.fillRect(x+s*2,y+s*2,s,s*2);
+  ctx.fillRect(x+s,y+s*4,s,s*2);
+}
+function zzz(x,y){
+  const ph=frame%3;
+  zGlyph(x,y-44-ph*8,4);
+  if(ph>0)zGlyph(x+30,y-84-ph*8,5);
+}
+function fmt(e){if(e<60)return e+"s";if(e<3600)return Math.floor(e/60)+"m"+String(e%60).padStart(2,"0")+"s";
+return Math.floor(e/3600)+"h"+String(Math.floor(e%3600/60)).padStart(2,"0")+"m"}
+function esc(s){const d=document.createElement("span");d.textContent=s||"";return d.innerHTML}
+function list(){
+  const now=Math.floor(Date.now()/1000)-drift;
+  const bosses=[...new Set(state.agents.map(a=>a.boss||0))];
+  const multi=bosses.length>1;
+  let h="";
+  for(const s of SLOTS){
+    const as=state.agents.filter(x=>x.agent==s.k);
+    if(as.length==0){h+=`<div class="row zz"><span class="code">${CODES[s.k]}</span><span>${NAMES[s.k]}</span><span>zzz</span></div>`;continue}
+    for(const a of as){
+      h+=`<div class="row"><span class="code">${CODES[s.k]}</span>`+
+         `<span class="t">${fmt(Math.max(0,now-a.start))}</span>`+
+         (multi?`<span class="sess">[${a.boss||"?"}]</span>`:"")+
+         `<span class="task">${esc(a.task)}</span><span class="act">${esc(a.action)}</span></div>`;
+    }
+  }
+  document.getElementById("list").innerHTML=h;
+  document.getElementById("sub").textContent=
+    state.agents.length+" agent"+(state.agents.length!=1?"s":"")+" au travail · "+
+    (bosses.filter(b=>state.agents.some(a=>(a.boss||0)==b)).length||0)+" session(s)";
+  let r="";
+  for(const x of state.recent){
+    r+=`<div class="run"><span class="${x.exit==0?"ok":"err"}">${x.exit==0?"✓":"✗"}</span>`+
+       `<span class="a">${esc(x.agent)}</span><span class="p">${esc((x.prompt_head||"").slice(0,110))}</span>`+
+       `<span>${esc((x.ts||"").slice(11,19))}</span></div>`;
+  }
+  document.getElementById("runs").innerHTML=r;
+}
+async function poll(){try{const r=await fetch("/api/state");state=await r.json();
+  drift=Math.floor(Date.now()/1000)-state.now;}catch(e){}list()}
+setInterval(()=>{frame++;draw()},420);
+setInterval(list,1000);
+poll();setInterval(poll,1500);
+</script></body></html>"""
+
+ALLOWED_HOSTS = {f"localhost:{PORT}", f"127.0.0.1:{PORT}"}
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        # Loopback-only server: refuse any other Host so a DNS-rebinding page
+        # cannot read /api/state (agent prompts, pids) from the browser.
+        if self.headers.get("Host", "") not in ALLOWED_HOSTS:
+            self.send_response(403); self.send_header("Content-Length", "0"); self.end_headers(); return
+        if self.path.startswith("/api/state"):
+            body = json.dumps(state()).encode()
+            ct = "application/json"
+        elif self.path == "/health":
+            body, ct = b"ok", "text/plain"
+        elif self.path.startswith("/assets/"):
+            name = os.path.basename(self.path)
+            fp = os.path.join(ASSETS_DIR, name)
+            if os.path.isfile(fp) and name.endswith(".png"):
+                body, ct = open(fp, "rb").read(), "image/png"
+            else:
+                self.send_response(404); self.end_headers(); return
+        else:
+            body, ct = PAGE.encode(), "text/html; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", ct)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+def main():
+    if "--stop" in sys.argv:
+        try:
+            pid = int(open(PIDFILE).read().strip())
+            os.kill(pid, signal.SIGTERM)
+            print(f"office-hq: stopped (pid {pid})")
+        except Exception:
+            print("office-hq: not running")
+        return
+    # already up?
+    try:
+        s = socket.create_connection(("127.0.0.1", PORT), timeout=1); s.close()
+        print(f"office-hq: already running: http://localhost:{PORT}")
+        return
+    except Exception:
+        pass
+    if "--daemon" in sys.argv:
+        args = [a for a in sys.argv[1:] if a != "--daemon"]
+        subprocess.Popen([sys.executable, os.path.abspath(__file__)] + args,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        print(f"office-hq: http://localhost:{PORT}")
+        return
+    os.makedirs(LOG_DIR, exist_ok=True)
+    open(PIDFILE, "w").write(str(os.getpid()))
+    srv = HTTPServer(("127.0.0.1", PORT), H)
+    try:
+        srv.serve_forever()
+    finally:
+        try: os.remove(PIDFILE)
+        except Exception: pass
+
+if __name__ == "__main__":
+    main()

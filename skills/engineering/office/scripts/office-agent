@@ -1,0 +1,202 @@
+#!/bin/zsh
+# office-agent: spawn a headless Claude Code agent under a non-Anthropic model.
+# Part of /office mode (skill ~/.claude/skills/office). Main loop (boss) stays on the
+# session model; this spawns executors on the Qwen Token Plan (via LiteLLM 10101)
+# or the Kimi coding plan (direct Anthropic-compatible endpoint).
+#
+# Usage:
+#   office-agent <agent|model> "prompt"        roster name or raw model id
+#   office-agent <agent|model> -f prompt.md    prompt from file
+#   echo "prompt" | office-agent <agent|model> -   prompt from stdin
+# Flags: --max-turns N (default 40), --json (raw result JSON on stdout),
+#        --task "one-phrase summary" (shown in the statusline)
+#
+# Roster: lead=Tanaka/tnk=qwen3.8-max-preview  ds=Suzuki/suz=deepseek-v4-flash-0731
+#         glm=Kenji/ken=glm-5.2  k2=Yuki/yuk=kimi-for-coding  flash=Hayate/hay=qwen3.6-flash
+# Logs: ~/.claude/office-logs/runs.jsonl  Liveness: ~/.claude/office-logs/active/*.json
+#
+# Liveness: the state file carries `task` (boss-provided summary) and `action`
+# (live: current tool + target, parsed from the claude stream-json output), so the
+# statusline can render one full line per agent in real time.
+#
+# Gotcha: the MaaS /v1/responses endpoint only serves qwen models. LiteLLM routes
+# openai-provider requests with thinking enabled to /responses, so glm-5.2 and
+# deepseek-v4-pro must run with thinking OFF (MAX_THINKING_TOKENS=0) to stay on
+# /chat/completions, which serves them fine.
+
+set -u
+
+LOG_DIR="$HOME/.claude/office-logs"
+ACTIVE_DIR="$LOG_DIR/active"
+LOG_FILE="$LOG_DIR/runs.jsonl"
+# launchd unit that owns the proxy (override with OFFICE_LITELLM_PLIST). If the
+# file doesn't exist we don't try to auto-start (see SETUP.md next to the skill's SKILL.md).
+PLIST="${OFFICE_LITELLM_PLIST:-$HOME/Library/LaunchAgents/com.office.litellm.plist}"
+PROXY_HEALTH="http://127.0.0.1:10101/health/liveliness"
+
+typeset -A ROSTER
+ROSTER=(lead qwen3.8-max-preview ds deepseek-v4-flash-0731 glm glm-5.2 k2 kimi-for-coding flash qwen3.6-flash)
+
+typeset -A ALIASES
+ALIASES=(tanaka lead tnk lead suzuki ds suz ds kenji glm ken glm yuki k2 yuk k2 hayate flash hay flash)
+
+usage() {
+  echo "usage: office-agent <lead|ds|glm|k2|flash|tanaka|tnk|suzuki|suz|kenji|ken|yuki|yuk|hayate|hay|model-id> [--max-turns N] [--json] [--task \"summary\"] \"prompt\" | -f file | -" >&2
+  exit 2
+}
+
+[[ $# -lt 1 ]] && usage
+
+target="$1"; shift
+max_turns=40
+prompt=""
+prompt_file=""
+task_summary=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --max-turns) max_turns="$2"; shift 2 ;;
+    --json) shift ;;  # kept for backward compat; result JSON is always captured
+    --task) task_summary="$2"; shift 2 ;;
+    -f) prompt_file="$2"; shift 2 ;;
+    -) prompt="$(cat)"; shift ;;
+    *) prompt="$1"; shift ;;
+  esac
+done
+
+if [[ -n "$prompt_file" ]]; then
+  prompt="$(cat -- "$prompt_file")" || { echo "office-agent: cannot read $prompt_file" >&2; exit 2; }
+fi
+[[ -z "$prompt" ]] && usage
+
+# Resolve: lowercase input -> ALIASES -> canonical roster key, then ROSTER -> model id
+target_lower="${(L)target}"
+resolved_key="${ALIASES[$target_lower]:-$target_lower}"
+model="${ROSTER[$resolved_key]:-$resolved_key}"
+# canonical_key is what we store in state/log (the real roster key, not the alias)
+if [[ -n "${ALIASES[$target_lower]:-}" ]]; then
+  canonical_key="${ALIASES[$target_lower]}"
+elif [[ -n "${ROSTER[$target_lower]:-}" ]]; then
+  canonical_key="$target_lower"
+else
+  canonical_key="$target"
+fi
+
+# Task summary: boss-provided --task, else first non-empty prompt line (70 chars)
+if [[ -z "$task_summary" ]]; then
+  task_summary="$(print -r -- "$prompt" | awk 'NF{print; exit}' | head -c 70)"
+fi
+
+# Route: kimi models go direct to api.kimi.com/coding, everything else via LiteLLM.
+if [[ "$model" == k3* || "$model" == kimi-* ]]; then
+  key="$(cat ~/.config/kimi/api_key 2>/dev/null)"
+  [[ -z "$key" ]] && { echo "office-agent: missing ~/.config/kimi/api_key" >&2; exit 1; }
+  base_url="https://api.kimi.com/coding"
+  auth_token="$key"
+else
+  if ! curl -sf -o /dev/null -m 3 "$PROXY_HEALTH"; then
+    if [[ ! -f "$PLIST" ]]; then
+      echo "office-agent: LiteLLM proxy not running on 127.0.0.1:10101 and no launchd unit found." >&2
+      echo "office-agent: start it manually:  litellm --config ~/.config/litellm/office.yaml --port 10101" >&2
+      echo "office-agent: full walkthrough: SETUP.md in the office skill folder" >&2
+      exit 1
+    fi
+    echo "office-agent: proxy down, starting via launchd..." >&2
+    launchctl load "$PLIST" 2>/dev/null
+    for i in $(seq 1 20); do
+      curl -sf -o /dev/null -m 2 "$PROXY_HEALTH" && break
+      sleep 2
+    done
+    curl -sf -o /dev/null -m 3 "$PROXY_HEALTH" || { echo "office-agent: proxy failed to start; check its log (see SETUP.md troubleshooting)" >&2; exit 1; }
+  fi
+  base_url="http://127.0.0.1:10101"
+  auth_token="${LITELLM_MASTER_KEY:-sk-local-office}"
+fi
+
+mkdir -p "$LOG_DIR" "$ACTIVE_DIR"
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+start_epoch="$(date +%s)"
+
+# glm-5.2 / deepseek-v4-pro: no thinking (would be routed to /responses -> upstream rejects)
+think_env=()
+case "$model" in
+  glm-*|deepseek-*) think_env=(MAX_THINKING_TOKENS=0) ;;
+esac
+
+# JSON-escape helper (quotes + backslashes) for embedding in the state file
+json_esc() { print -r -- "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' '; }
+
+# Find the claude process that owns this spawn (walk up the process tree). The
+# statusline does the same walk and only shows agents whose boss matches its own
+# session, so agents stop leaking into every Claude Code session's statusline.
+boss_pid=0
+_p=$$
+for _ in {1..10}; do
+  _p="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')"
+  [[ -z "$_p" || "$_p" -le 1 ]] && break
+  case "$(ps -o comm= -p "$_p" 2>/dev/null)" in
+    *claude*) boss_pid=$_p; break ;;
+  esac
+done
+
+# Write liveness state file so the statusline can render this agent live.
+# Fields: task = boss summary, action = live current tool/text (updated below).
+STATE_FILE="$ACTIVE_DIR/${canonical_key}-$$.json"
+task_esc="$(json_esc "$task_summary" | head -c 90)"
+write_state() {
+  local action_esc; action_esc="$(json_esc "$1" | head -c 100)"
+  printf '{"agent":"%s","model":"%s","pid":%d,"boss":%d,"start":%d,"task":"%s","action":"%s","updated":%d}\n' \
+    "$canonical_key" "$model" "$$" "$boss_pid" "$start_epoch" "$task_esc" "$action_esc" "$(date +%s)" \
+    > "$STATE_FILE.tmp" && mv -f "$STATE_FILE.tmp" "$STATE_FILE"
+}
+write_state "starting"
+trap 'rm -f "$STATE_FILE" "$STATE_FILE.tmp"' EXIT INT TERM
+
+# Run headless claude with stream-json so we can mirror the live action into the
+# state file. Final result line is captured and re-emitted on stdout at the end.
+RESULT_RAW="$LOG_DIR/.result-$$.json"
+rm -f "$RESULT_RAW"
+
+env "${think_env[@]}" \
+ANTHROPIC_BASE_URL="$base_url" \
+ANTHROPIC_AUTH_TOKEN="$auth_token" \
+ANTHROPIC_MODEL="$model" \
+ANTHROPIC_DEFAULT_FABLE_MODEL="$model" \
+ANTHROPIC_DEFAULT_OPUS_MODEL="$model" \
+ANTHROPIC_DEFAULT_SONNET_MODEL="$model" \
+ANTHROPIC_DEFAULT_HAIKU_MODEL="$model" \
+CLAUDE_CODE_SUBAGENT_MODEL="$model" \
+ENABLE_TOOL_SEARCH="true" \
+claude -p --output-format stream-json --verbose --dangerously-skip-permissions --max-turns "$max_turns" "$prompt" | \
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"assistant"'*)
+      action="$(printf '%s' "$line" | jq -rj '
+        [.message.content[]? |
+          if .type == "tool_use" then
+            (.name + " " + ((.input.file_path // .input.command // .input.description // .input.pattern // .input.query // "") | tostring))
+          elif .type == "text" then
+            (.text | gsub("[\\n\\r]+"; " "))
+          else empty end] | last // empty' 2>/dev/null | head -c 100)"
+      [[ -n "$action" ]] && write_state "$action"
+      ;;
+    *'"type":"result"'*)
+      printf '%s\n' "$line" > "$RESULT_RAW"
+      ;;
+  esac
+done
+rc=${pipestatus[1]}
+
+rm -f "$STATE_FILE" "$STATE_FILE.tmp"
+
+# Emit the agent's final reply on stdout
+if [[ -f "$RESULT_RAW" ]]; then
+  jq -r '.result // empty' "$RESULT_RAW" 2>/dev/null || cat "$RESULT_RAW"
+  rm -f "$RESULT_RAW"
+fi
+
+prompt_head="$(print -r -- "$prompt" | head -c 120 | tr '\n' ' ' | sed 's/"/\\"/g')"
+printf '{"ts":"%s","agent":"%s","model":"%s","cwd":"%s","exit":%d,"prompt_head":"%s"}\n' \
+  "$ts" "$canonical_key" "$model" "$PWD" "$rc" "$prompt_head" >> "$LOG_FILE"
+
+exit $rc

@@ -1,0 +1,103 @@
+{
+  "name": "wecko-ai",
+  "owner": {
+    "name": "Wecko",
+    "email": "contact@wecko.ai",
+    "url": "https://wecko.ai"
+  },
+  "metadata": {
+    "description": "Wecko's agent skills and plugins (wecko.ai): one plugin per bucket, install only what you need."
+  },
+  "plugins": [
+    {
+      "name": "wecko-engineering",
+      "source": "./",
+      "description": "Agent orchestration (/office), prompt refinement with a local LLM (/promptfit), a vision bridge for text-only models, and local LLM sizing guides.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Wecko",
+        "url": "https://wecko.ai"
+      },
+      "license": "MIT",
+      "keywords": [
+        "agents",
+        "orchestration",
+        "local-llm",
+        "prompt",
+        "vision"
+      ],
+      "category": "engineering",
+      "strict": false,
+      "skills": [
+        "./skills/engineering/apple-silicon-ram-guide",
+        "./skills/engineering/find-local-llm",
+        "./skills/engineering/office",
+        "./skills/engineering/promptfit",
+        "./skills/engineering/vision"
+      ]
+    },
+    {
+      "name": "wecko-productivity",
+      "source": "./",
+      "description": "Session wrap-up (/closing): persist memory, verify what shipped, list loose ends.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Wecko",
+        "url": "https://wecko.ai"
+      },
+      "license": "MIT",
+      "keywords": [
+        "productivity",
+        "session",
+        "memory"
+      ],
+      "category": "productivity",
+      "strict": false,
+      "skills": [
+        "./skills/productivity/closing"
+      ]
+    },
+    {
+      "name": "wecko-video",
+      "source": "./",
+      "description": "Video post-production: YouTube audio mastering and word-by-word karaoke captions.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Wecko",
+        "url": "https://wecko.ai"
+      },
+      "license": "MIT",
+      "keywords": [
+        "video",
+        "youtube",
+        "audio",
+        "captions"
+      ],
+      "category": "video",
+      "strict": false,
+      "skills": [
+        "./skills/video/karaoke-captions",
+        "./skills/video/youtube-audio-master"
+      ]
+    },
+    {
+      "name": "wecko-agent-notify",
+      "source": "./plugins/agent-notify",
+      "description": "Phone ping (ntfy, Telegram, any command) when Claude Code is really done: waits for background agents, teammates and shells, and stays quiet while you are at the Mac.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Wecko",
+        "url": "https://wecko.ai"
+      },
+      "license": "MIT",
+      "keywords": [
+        "notifications",
+        "hooks",
+        "telegram",
+        "ntfy",
+        "macos"
+      ],
+      "category": "productivity"
+    }
+  ]
+}

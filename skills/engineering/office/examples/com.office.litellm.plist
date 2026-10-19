@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- launchd unit that keeps the office LiteLLM proxy alive on macOS.
+     1. Replace the /ABSOLUTE/PATH/TO placeholders (launchd does not expand ~) with the litellm
+        binary (`which litellm`) and your office.yaml, and set your provider key.
+     2. cp to ~/Library/LaunchAgents/ then: launchctl load ~/Library/LaunchAgents/com.office.litellm.plist
+     office-agent expects the plist label/path below in its PLIST= variable; adjust
+     the script if you rename it. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.office.litellm</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/litellm</string>
+    <string>--config</string>
+    <string>/ABSOLUTE/PATH/TO/HOME/.config/litellm/office.yaml</string>
+    <string>--port</string>
+    <string>10101</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OFFICE_PROVIDER_KEY</key>
+    <string>your-provider-key</string>
+    <key>LITELLM_MASTER_KEY</key>
+    <string>sk-local-office</string>
+    <key>LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES</key>
+    <string>true</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/office-litellm.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/office-litellm.log</string>
+</dict>
+</plist>

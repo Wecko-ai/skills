@@ -1,0 +1,3 @@
+interface:
+  display_name: "Find Local LLM"
+  short_description: "Pick the best local LLM for your Apple device"

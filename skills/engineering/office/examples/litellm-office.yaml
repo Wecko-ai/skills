@@ -1,0 +1,46 @@
+# LiteLLM proxy config for /office mode.
+# Exposes an Anthropic-compatible API (/v1/messages) in front of any
+# OpenAI-compatible provider, so headless Claude Code processes can run on it.
+#
+# Replace api_base + model ids with YOUR provider's. Key comes from the
+# OFFICE_PROVIDER_KEY env var (set it in the proxy's environment).
+#
+# Run:  litellm --config ~/.config/litellm/office.yaml --port 10101
+# Required env (see SETUP.md):
+#   OFFICE_PROVIDER_KEY, LITELLM_MASTER_KEY,
+#   LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES=true
+
+model_list:
+  # main executor ("lead" in the roster)
+  - model_name: qwen3.8-max-preview
+    litellm_params:
+      model: openai/qwen3.8-max-preview
+      api_base: https://your-provider.example.com/compatible-mode/v1
+      api_key: os.environ/OFFICE_PROVIDER_KEY
+
+  # executor B + adversarial reviewer ("ds")
+  - model_name: deepseek-v4-flash-0731
+    litellm_params:
+      model: openai/deepseek-v4-flash-0731
+      api_base: https://your-provider.example.com/compatible-mode/v1
+      api_key: os.environ/OFFICE_PROVIDER_KEY
+
+  # executor C + second reviewer ("glm")
+  - model_name: glm-5.2
+    litellm_params:
+      model: openai/glm-5.2
+      api_base: https://your-provider.example.com/compatible-mode/v1
+      api_key: os.environ/OFFICE_PROVIDER_KEY
+
+  # cheap mechanical worker ("flash")
+  - model_name: qwen3.6-flash
+    litellm_params:
+      model: openai/qwen3.6-flash
+      api_base: https://your-provider.example.com/compatible-mode/v1
+      api_key: os.environ/OFFICE_PROVIDER_KEY
+
+litellm_settings:
+  drop_params: true   # Claude Code sends Anthropic params with no OpenAI equivalent
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
