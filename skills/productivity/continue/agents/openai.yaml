@@ -1,0 +1,5 @@
+interface:
+  display_name: "Continue"
+  short_description: "Hand off a full session to a fresh one"
+policy:
+  allow_implicit_invocation: false

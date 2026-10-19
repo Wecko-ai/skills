@@ -46,6 +46,7 @@ Coding workflow, agent orchestration, local LLMs. [Bucket README](./skills/engin
 [Bucket README](./skills/productivity/README.md)
 
 - **[closing](./skills/productivity/closing/SKILL.md)**: Wrap up a session before closing it: persist memory, keep `CLAUDE.md` lean and true, verify what shipped is live, list loose ends. User-invoked: `/closing`.
+- **[continue](./skills/productivity/continue/SKILL.md)**: Hand off a session whose context is filling up: stop at a clean point, check the real git state, and get a self-contained prompt (copied and saved) to resume in a fresh conversation. User-invoked: `/continue [focus]`.
 
 ## Video
 

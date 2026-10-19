@@ -39,8 +39,8 @@
     {
       "name": "wecko-productivity",
       "source": "./",
-      "description": "Session wrap-up (/closing): persist memory, verify what shipped, list loose ends.",
-      "version": "1.0.0",
+      "description": "Session wrap-up (/closing): persist memory, verify what shipped, list loose ends. Session handoff (/continue): stop cleanly when the context fills up and get a prompt to resume in a fresh session.",
+      "version": "1.1.0",
       "author": {
         "name": "Wecko",
         "url": "https://wecko.ai"
@@ -49,12 +49,15 @@
       "keywords": [
         "productivity",
         "session",
-        "memory"
+        "memory",
+        "handoff",
+        "context"
       ],
       "category": "productivity",
       "strict": false,
       "skills": [
-        "./skills/productivity/closing"
+        "./skills/productivity/closing",
+        "./skills/productivity/continue"
       ]
     },
     {
